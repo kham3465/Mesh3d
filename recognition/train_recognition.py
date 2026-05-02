@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets
+from tqdm import tqdm
 
 from recognition.models import EmbeddingNet
 from recognition.dataset import default_transforms
@@ -17,7 +18,8 @@ def train_one_epoch(model, classifier, loader, optimizer, device, backbone_finet
     classifier.train()
     total, loss_sum = 0, 0.0
     criterion = nn.CrossEntropyLoss()
-    for imgs, labels in loader:
+    pbar = tqdm(loader, desc='Training', leave=False)
+    for imgs, labels in pbar:
         imgs = imgs.to(device)
         labels = labels.to(device)
         if backbone_finetune:
@@ -32,6 +34,7 @@ def train_one_epoch(model, classifier, loader, optimizer, device, backbone_finet
         optimizer.step()
         total += labels.size(0)
         loss_sum += loss.item() * labels.size(0)
+        pbar.set_postfix(loss=f'{loss.item():.4f}')
     return loss_sum / max(total, 1)
 
 def eval_one_epoch(model, classifier, loader, device):
@@ -39,7 +42,8 @@ def eval_one_epoch(model, classifier, loader, device):
     classifier.eval()
     total, correct = 0, 0
     with torch.no_grad():
-        for imgs, labels in loader:
+        pbar = tqdm(loader, desc='Evaluating', leave=False)
+        for imgs, labels in pbar:
             imgs = imgs.to(device)
             labels = labels.to(device)
             emb = model(imgs)
