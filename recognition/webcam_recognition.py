@@ -228,4 +228,5 @@ if __name__ == '__main__':
     p.add_argument('--cam', type=int, default=0)
     p.add_argument('--gallery_fp', default='gallery.pkl', help='path to persist gallery')
     args = p.parse_args()
-    run(args.checkpoint, args.gallery, device=args.device, threshold=args.threshold,
+    run(args.checkpoint, args.gallery, device=args.device, threshold=args.threshold, 
+        cam_id=args.cam, gallery_fp=args.gallery_fp)

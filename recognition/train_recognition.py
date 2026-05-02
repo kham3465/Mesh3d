@@ -69,8 +69,11 @@ if __name__ == '__main__':
     p.add_argument('--backbone', default='resnet50')
     p.add_argument('--pretrained', action='store_true')
     p.add_argument('--fine_tune', action='store_true', help='allow backbone weights to update if set')
+    p.add_argument('--s', type=float, default=30.0, help='arcface scale')
+    p.add_argument('--m', type=float, default=0.5, help='arcface margin')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--save_dir', default='checkpoints')
+    p.add_argument('--resume', default=None, help='path to checkpoint to resume from')
     p.add_argument('--workers', type=int, default=4)
     args = p.parse_args()
 
@@ -95,7 +98,7 @@ if __name__ == '__main__':
     classifier = ArcMarginProduct(
         in_features=args.embedding_size, 
         out_features=num_classes, 
-        s=30.0, m=0.5).to(device)
+        s=args.s, m=args.m).to(device)
 
     # choose params to optimize
     if args.fine_tune:
@@ -104,13 +107,31 @@ if __name__ == '__main__':
         # freeze backbone
         for p in model.backbone.parameters():
             p.requires_grad = False
-        params = list(classifier.parameters())
+        # Luôn huấn luyện lớp embedding và classifier
+        params = list(model.embedding.parameters()) + list(classifier.parameters())
 
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
+    start_epoch = 1
     best_acc = 0.0
-    for epoch in range(1, args.epochs + 1):
+
+    # Resume logic
+    if args.resume and os.path.isfile(args.resume):
+        print(f'=> Loading checkpoint "{args.resume}"')
+        ck = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ck['model'])
+        classifier.load_state_dict(ck['classifier'])
+        optimizer.load_state_dict(ck['optimizer'])
+        start_epoch = ck['epoch'] + 1
+        if 'best_acc' in ck:
+            best_acc = ck['best_acc']
+        # Update scheduler to match the resumed epoch
+        for _ in range(start_epoch - 1):
+            scheduler.step()
+        print(f'=> Resumed from epoch {ck["epoch"]} with best_acc {best_acc:.4f}')
+
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         train_loss = train_one_epoch(model, classifier, train_loader, optimizer, device, args.fine_tune)
         scheduler.step()
@@ -128,6 +149,7 @@ if __name__ == '__main__':
             'classes': classes,
             'backbone': args.backbone,
             'embedding_size': args.embedding_size,
+            'best_acc': best_acc,
         }
         
         # Save latest
