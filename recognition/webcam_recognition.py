@@ -7,9 +7,17 @@ Press 'n' to enroll new person (collect K samples), 's' save snapshot, 'r' rebui
 """
 import time
 import os
+import sys
+
+# Thêm thư mục gốc vào sys.path để tìm thấy FaceBoxes, TDDFA và recognition
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if root_path not in sys.path:
+    sys.path.insert(0, root_path)
+
 import cv2
 import torch
 import numpy as np
+import yaml
 from FaceBoxes.FaceBoxes import FaceBoxes
 from TDDFA import TDDFA
 from recognition.models import EmbeddingNet
@@ -20,114 +28,177 @@ try:
 except Exception:
     crop_img = None
 
-def run(checkpoint, gallery_root, device='cpu', threshold=0.4, cam_id=0, input_size=112, gallery_fp='gallery.pkl'):
+def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_id=0, input_size=112, gallery_fp='gallery.pkl', use_onnx=False, frame_skip=3):
     device = torch.device(device)
 
     if not os.path.exists(checkpoint):
         raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
-    ck = torch.load(checkpoint, map_location=device)
 
-    model = EmbeddingNet().to(device)
-    model.eval()
-    ck_model = ck.get('model', ck)
-    try:
-        model.load_state_dict(ck_model)
-    except Exception:
-        model.load_state_dict(ck_model, strict=False)
+    # Sử dụng ONNX Runtime nếu file có đuôi .onnx hoặc được yêu cầu
+    onnx_session = None
+    model = None
+    if checkpoint.endswith('.onnx') or use_onnx:
+        import onnxruntime as ort
+        print(f"Loading ONNX model from {checkpoint}...")
+        # Sử dụng CPU với số luồng tối ưu
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 4
+        onnx_session = ort.InferenceSession(checkpoint, sess_options, providers=['CPUExecutionProvider'])
+    else:
+        print(f"Loading PyTorch model from {checkpoint}...")
+        ck = torch.load(checkpoint, map_location=device)
+        model = EmbeddingNet().to(device)
+        model.eval()
+        ck_model = ck.get('model', ck)
+        try:
+            model.load_state_dict(ck_model)
+        except Exception:
+            model.load_state_dict(ck_model, strict=False)
+
+    cfg = yaml.load(open(config_path), Loader=yaml.SafeLoader)
 
     face_detector = FaceBoxes()
-    tddfa = TDDFA(gpu_mode=(device.type == 'cuda'))
+    tddfa = TDDFA(gpu_mode=(device.type == 'cuda'), **cfg)
     transform = default_transforms(input_size)
 
     # Load persisted gallery if exists, otherwise build from folder
     gallery = load_gallery(gallery_fp, device=device)
     if len(gallery) == 0 and os.path.isdir(gallery_root):
         print('Building gallery from folder...')
-        gallery = build_gallery_embeddings(model, gallery_root, device=device)
+        # Sử dụng onnx_session nếu có, nếu không dùng model PyTorch
+        gallery = build_gallery_embeddings(onnx_session if onnx_session else model, gallery_root, device=device)
         save_gallery(gallery, gallery_fp)
-    print(f'Loaded gallery with {len(gallery)} identities (from {gallery_fp} / {gallery_root})')
 
-    cap = cv2.VideoCapture(cam_id)
+    # Khởi tạo gallery dạng Tensor để tính toán similarity cực nhanh (vector hóa)
+    gallery_names = []
+    gallery_tensor = None
+    if len(gallery) > 0:
+        gallery_names = list(gallery.keys())
+        gallery_tensor = torch.stack([v.to(device) for v in gallery.values()])
+    
+    print(f'Loaded gallery with {len(gallery_names)} identities (from {gallery_fp} / {gallery_root})')
+
+    # Trên Windows, sử dụng cv2.CAP_DSHOW giúp khởi động camera ổn định hơn
+    if os.name == 'nt':
+        cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(cam_id)
+
     if not cap.isOpened():
         print('Cannot open webcam')
         return
 
+    # Thiết lập camera để tránh bị tối trên Windows
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Xóa các dòng cap.set gây lỗi grab frame trên Windows
+    # Nếu cam vẫn tối, hãy kiểm tra ánh sáng phòng hoặc gạt che cam vật lý
+    print('Warming up camera...')
+
+    for _ in range(30):
+        cap.read()
+
     fps_t0 = time.time()
     fps_count = 0
+    frame_idx = 0
+    
+    # Biến lưu trữ kết quả của frame trước để hiển thị khi skip
+    last_results = [] # List of {bbox, label, sim, verts}
 
     print('Press q to quit, s to save a snapshot, r to reload gallery, n to enroll new person')
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        img = frame.copy()
+        
+        display_frame = frame
+        frame_idx += 1
+        
+        # Tăng tốc: Giảm kích thước ảnh khi đưa vào FaceBoxes
+        h_orig, w_orig = frame.shape[:2]
+        img_small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        img = img_small.copy()
 
-        dets = face_detector(img)
-        if len(dets) > 0:
-            boxes = [[int(b[0]), int(b[1]), int(b[2]), int(b[3]), b[4]] for b in dets]
-            try:
-                params, rois = tddfa(img, boxes)
-                verts_lst = tddfa.recon_vers(params, rois, dense_flag=False)
-            except Exception:
-                params, rois, verts_lst = [], [], []
-
-            for i, (bbox, verts) in enumerate(zip(boxes, verts_lst)):
-                x1, y1, x2, y2, score = bbox
-                h, w = frame.shape[:2]
-                x1 = max(0, min(w - 1, x1))
-                x2 = max(0, min(w - 1, x2))
-                y1 = max(0, min(h - 1, y1))
-                y2 = max(0, min(h - 1, y2))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
-
-                # extract crop for recognition (prefer roi crop if available)
-                crop = None
+        # Chỉ chạy Recognition và 3D Mesh mỗi N frames để tăng FPS
+        if frame_idx % frame_skip == 0 or frame_idx < 5:
+            dets = face_detector(img)
+            current_results = []
+            
+            if len(dets) > 0:
+                # Chỉ lấy top khuôn mặt lớn nhất để tránh nhiễu và tăng FPS
+                dets = sorted(dets, key=lambda x: (x[2]-x[0])*(x[3]-x[1]), reverse=True)[:2]
+                
+                boxes = [[int(b[0]), int(b[1]), int(b[2]), int(b[3]), b[4]] for b in dets]
                 try:
-                    if crop_img is not None and rois:
-                        # Use the correct ROI for the current face index
-                        crop = crop_img(frame, rois[i])
-                    else:
-                        crop = frame[y1:y2, x1:x2]
+                    params, rois = tddfa(img, boxes)
+                    verts_lst = tddfa.recon_vers(params, rois, dense_flag=False)
                 except Exception:
-                    crop = frame[y1:y2, x1:x2]
+                    params, rois, verts_lst = [], [], []
 
-                emb = None
-                if crop is not None and crop.size != 0:
+                for i, (bbox, verts) in enumerate(zip(boxes, verts_lst)):
+                    x1, y1, x2, y2 = [int(v * 2) for v in bbox[:4]]
+                    
+                    # Recognition logic
+                    crop = None
                     try:
-                        from PIL import Image
-                        pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                        x = transform(pil).unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            emb = model(x).cpu().squeeze(0)
+                        if crop_img is not None and rois:
+                            scaled_roi = [v * 2 for v in rois[i]]
+                            crop = crop_img(frame, scaled_roi)
+                        else:
+                            crop = frame[max(0,y1):y2, max(0,x1):x2]
                     except Exception:
-                        emb = None
+                        crop = frame[max(0,y1):y2, max(0,x1):x2]
 
-                # match gallery
-                best_label = 'Unknown'
-                best_sim = -1.0
-                if emb is not None and len(gallery) > 0:
-                    for label, gemb in gallery.items():
-                        sim = float((emb * gemb).sum().item())
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_label = label
-                    if best_sim < threshold:
-                        best_label = 'Unknown'
+                    emb = None
+                    if crop is not None and crop.size != 0:
+                        try:
+                            from PIL import Image
+                            pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                            input_tensor = transform(pil).unsqueeze(0).numpy()
+                            if onnx_session is not None:
+                                inputs = {onnx_session.get_inputs()[0].name: input_tensor}
+                                emb = torch.from_numpy(onnx_session.run(None, inputs)[0]).squeeze(0)
+                            else:
+                                with torch.no_grad():
+                                    emb = model(torch.from_numpy(input_tensor).to(device)).squeeze(0)
+                        except Exception: pass
 
-                txt = f'{best_label} {best_sim:.3f}' if best_sim >= 0 else best_label
-                cv2.putText(img, txt, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    best_label, best_sim = 'Unknown', -1.0
+                    if emb is not None and gallery_tensor is not None:
+                        # Tính toán similarity vector hóa (cực nhanh)
+                        emb_norm = emb / (emb.norm() + 1e-8)
+                        sims = torch.matmul(gallery_tensor, emb_norm.to(device))
+                        max_sim, max_idx = torch.max(sims, dim=0)
+                        best_sim = float(max_sim.item())
+                        best_label = gallery_names[max_idx.item()]
+                        
+                        if best_sim < threshold: best_label = 'Unknown'
+                    
+                    current_results.append({
+                        'bbox': (x1, y1, x2, y2),
+                        'label': best_label,
+                        'sim': best_sim,
+                        'verts': verts
+                    })
+            last_results = current_results
 
-                # draw projected 3D points (first two coords)
-                try:
-                    pts2 = verts[:2].T.astype(int)
-                    for (px, py) in pts2:
-                        if 0 <= px < img.shape[1] and 0 <= py < img.shape[0]:
-                            cv2.circle(img, (px, py), 1, (0, 0, 255), -1)
-                except Exception:
-                    pass
+        # Vẽ kết quả (từ frame hiện tại hoặc frame trước đó)
+        for res in last_results:
+            x1, y1, x2, y2 = res['bbox']
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            
+            txt = f"{res['label']} {res['sim']:.2f}" if res['sim'] >= 0 else res['label']
+            cv2.putText(display_frame, txt, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Draw 3D points (Vẽ thưa hơn để giảm tải CPU và bớt nhiễu mắt)
+            try:
+                pts2 = (res['verts'][:2].T * 2).astype(int)
+                for i_pt in range(0, len(pts2), 5): # Tăng bước nhảy để vẽ ít điểm hơn
+                    px, py = pts2[i_pt]
+                    if 0 <= px < w_orig and 0 <= py < h_orig:
+                        cv2.circle(display_frame, (px, py), 1, (0, 0, 255), -1)
+            except Exception: pass
 
         # FPS
         fps_count += 1
@@ -138,23 +209,30 @@ def run(checkpoint, gallery_root, device='cpu', threshold=0.4, cam_id=0, input_s
         else:
             fps = None
         if fps is not None:
-            cv2.putText(img, f'FPS: {fps:.1f}', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            cv2.putText(display_frame, f'FPS: {fps:.1f}', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        cv2.imshow('3D Face Recognition (q to quit)', img)
+        cv2.imshow('3D Face Recognition (q to quit)', display_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('s'):
             ts = int(time.time())
             fn = f'webcam_snapshot_{ts}.jpg'
-            cv2.imwrite(fn, img)
+            cv2.imwrite(fn, display_frame)
             print('Saved', fn)
         elif key == ord('r'):
             print('Reloading gallery from folder and file...')
             gallery = load_gallery(gallery_fp, device=device)
             if len(gallery) == 0 and os.path.isdir(gallery_root):
-                gallery = build_gallery_embeddings(model, gallery_root, device=device)
+                gallery = build_gallery_embeddings(onnx_session if onnx_session else model, gallery_root, device=device)
                 save_gallery(gallery, gallery_fp)
+            
+            # Cập nhật tensor để nhận diện được ngay
+            if len(gallery) > 0:
+                gallery_names = list(gallery.keys())
+                gallery_tensor = torch.stack([v.to(device) for v in gallery.values()])
+            else:
+                gallery_names, gallery_tensor = [], None
             print(f'Loaded gallery with {len(gallery)} identities')
         elif key == ord('n'):
             # enroll new person
@@ -196,9 +274,14 @@ def run(checkpoint, gallery_root, device='cpu', threshold=0.4, cam_id=0, input_s
                             crop2 = frame2[y1b:y2b, x1b:x2b]
                         from PIL import Image
                         pil2 = Image.fromarray(cv2.cvtColor(crop2, cv2.COLOR_BGR2RGB))
-                        x_in = transform(pil2).unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            emb2 = model(x_in).cpu().squeeze(0)
+                        x_in_numpy = transform(pil2).unsqueeze(0).numpy()
+                        
+                        if onnx_session is not None:
+                            inputs2 = {onnx_session.get_inputs()[0].name: x_in_numpy}
+                            emb2 = torch.from_numpy(onnx_session.run(None, inputs2)[0]).squeeze(0)
+                        else:
+                            with torch.no_grad():
+                                emb2 = model(torch.from_numpy(x_in_numpy).to(device)).cpu().squeeze(0)
                         collected.append(emb2)
                         print(f'Collected {len(collected)}/{K}')
                     except Exception:
@@ -213,6 +296,11 @@ def run(checkpoint, gallery_root, device='cpu', threshold=0.4, cam_id=0, input_s
                     mean_emb = mean_emb / (mean_emb.norm() + 1e-8)
                     gallery[name] = mean_emb.to(device)
                     save_gallery(gallery, gallery_fp)
+                    
+                    # QUAN TRỌNG: Cập nhật lại tensor để máy nhận ra bạn ngay lập tức
+                    gallery_names = list(gallery.keys())
+                    gallery_tensor = torch.stack([v.to(device) for v in gallery.values()])
+                    
                     print(f'Enrolled \"{name}\" with {len(collected)} samples. Gallery size={len(gallery)}')
 
     cap.release()
@@ -222,11 +310,14 @@ if __name__ == '__main__':
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument('--checkpoint', required=True)
+    p.add_argument('--config', default='configs/mb1_120x120.yml', help='path to tddfa config')
     p.add_argument('--gallery', required=True)
     p.add_argument('--device', default='cpu')
     p.add_argument('--threshold', type=float, default=0.4)
     p.add_argument('--cam', type=int, default=0)
+    p.add_argument('--onnx', action='store_true', help='use onnxruntime for inference')
+    p.add_argument('--skip', type=int, default=3, help='process heavy inference every N frames')
     p.add_argument('--gallery_fp', default='gallery.pkl', help='path to persist gallery')
     args = p.parse_args()
-    run(args.checkpoint, args.gallery, device=args.device, threshold=args.threshold, 
-        cam_id=args.cam, gallery_fp=args.gallery_fp)
+    run(args.checkpoint, args.gallery, args.config, device=args.device, threshold=args.threshold, 
+        cam_id=args.cam, gallery_fp=args.gallery_fp, use_onnx=args.onnx, frame_skip=args.skip)

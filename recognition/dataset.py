@@ -48,13 +48,17 @@ def default_transforms(size=112):
 def build_gallery_embeddings(model, gallery_root, device='cpu', transform=None, exts=('.jpg', '.jpeg', '.png')):
     """Build gallery dict label->mean_embedding (torch.Tensor on device).
 
-    model: embedding model returning L2-normalized vectors or raw embeddings (will be normalized).
+    model: PyTorch model or onnxruntime.InferenceSession.
     gallery_root: folder with subfolders per identity containing images.
     device: device for model and output tensors.
     transform: torchvision transform to apply; if None uses default_transforms(112).
     """
     device = torch.device(device)
-    model.to(device).eval()
+    
+    is_onnx = not isinstance(model, torch.nn.Module) and model is not None
+    if not is_onnx and model is not None:
+        model.to(device).eval()
+
     if transform is None:
         transform = default_transforms(112)
 
@@ -76,9 +80,14 @@ def build_gallery_embeddings(model, gallery_root, device='cpu', transform=None, 
             try:
                 from PIL import Image
                 img = Image.open(fp).convert('RGB')
-                x = transform(img).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    e = model(x)
+                x_numpy = transform(img).unsqueeze(0).numpy()
+                
+                if is_onnx:
+                    inputs = {model.get_inputs()[0].name: x_numpy}
+                    e = torch.from_numpy(model.run(None, inputs)[0])
+                else:
+                    with torch.no_grad():
+                        e = model(torch.from_numpy(x_numpy).to(device))
                 e = e.squeeze(0).cpu()
                 e = e / (e.norm() + 1e-8)
                 emb_list.append(e)

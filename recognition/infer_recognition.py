@@ -1,6 +1,14 @@
 """Inference utilities: build gallery and infer an image.
 """
 import argparse
+import os
+import sys
+
+# Thêm thư mục gốc vào sys.path
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if root_path not in sys.path:
+    sys.path.insert(0, root_path)
+
 import torch
 import numpy as np
 from PIL import Image
