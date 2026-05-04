@@ -30,6 +30,8 @@ class ArcMarginProduct(nn.Module):
         # weight should be normalized
         cosine = F.linear(F.normalize(input), F.normalize(self.weight))
         sine = torch.sqrt(1.0 - torch.clamp(cosine ** 2, 0, 1))
+        # Sử dụng clamp để tránh giá trị âm cực nhỏ gây lỗi căn bậc hai
+        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), 1e-9, 1.0))
         phi = cosine * self.cos_m - sine * self.sin_m
         if self.easy_margin:
             phi = torch.where(cosine > 0, phi, cosine)

@@ -28,7 +28,7 @@ try:
 except Exception:
     crop_img = None
 
-def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_id=0, input_size=112, gallery_fp='gallery.pkl', use_onnx=False, frame_skip=3):
+def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.6, cam_id=0, input_size=112, gallery_fp='gallery.pkl', use_onnx=False, frame_skip=3):
     device = torch.device(device)
 
     if not os.path.exists(checkpoint):
@@ -132,7 +132,7 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
                 boxes = [[int(b[0]), int(b[1]), int(b[2]), int(b[3]), b[4]] for b in dets]
                 try:
                     params, rois = tddfa(img, boxes)
-                    verts_lst = tddfa.recon_vers(params, rois, dense_flag=False)
+                    verts_lst = tddfa.recon_vers(params, rois, dense_flag=True)
                 except Exception:
                     params, rois, verts_lst = [], [], []
 
@@ -191,10 +191,10 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
             txt = f"{res['label']} {res['sim']:.2f}" if res['sim'] >= 0 else res['label']
             cv2.putText(display_frame, txt, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # Draw 3D points (Vẽ thưa hơn để giảm tải CPU và bớt nhiễu mắt)
+            # Draw 3D points (Hiển thị toàn bộ các điểm mesh)
             try:
                 pts2 = (res['verts'][:2].T * 2).astype(int)
-                for i_pt in range(0, len(pts2), 5): # Tăng bước nhảy để vẽ ít điểm hơn
+                for i_pt in range(len(pts2)): # Vẽ toàn bộ điểm (stride = 1)
                     px, py = pts2[i_pt]
                     if 0 <= px < w_orig and 0 <= py < h_orig:
                         cv2.circle(display_frame, (px, py), 1, (0, 0, 255), -1)
@@ -210,8 +210,12 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
             fps = None
         if fps is not None:
             cv2.putText(display_frame, f'FPS: {fps:.1f}', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        
+        # Hiển thị số lượng người hiện có trong Gallery
+        gallery_count = len(gallery_names) if gallery_names else 0
+        cv2.putText(display_frame, f'Gallery: {gallery_count}', (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        cv2.imshow('3D Face Recognition (q to quit)', display_frame)
+        cv2.imshow('3D Face Recognition (q to quit, c to reset)', display_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -234,6 +238,15 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
             else:
                 gallery_names, gallery_tensor = [], None
             print(f'Loaded gallery with {len(gallery)} identities')
+        elif key == ord('c'):
+            # Tính năng Reset Gallery
+            print('Resetting gallery...')
+            gallery = {}
+            gallery_names = []
+            gallery_tensor = None
+            if os.path.exists(gallery_fp):
+                os.remove(gallery_fp)
+            print('Gallery cleared and gallery.pkl removed.')
         elif key == ord('n'):
             # enroll new person
             import tkinter as tk
@@ -249,19 +262,28 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
                 print('Empty name, abort')
             else:
                 K = 10
-                timeout = 12.0
+                timeout = 60.0
+                interval = 4.0
+                last_sample_t = 0
                 collected = []
-                print(f'Collecting up to {K} face samples for \"{name}\". Please look at camera.')
+                print(f'Collecting {K} samples for "{name}" over ~40s. Please rotate your head slowly.')
                 start_t = time.time()
                 attempts = 0
                 while len(collected) < K and time.time() - start_t < timeout:
                     ret2, frame2 = cap.read()
                     if not ret2:
                         continue
+                    
+                    # Luôn hiển thị camera trong lúc đợi để người dùng không thấy bị đứng hình
+                    cv2.imshow('3D Face Recognition (q to quit, c to reset)', frame2)
+                    cv2.waitKey(1)
+                    
+                    # Kiểm tra khoảng cách thời gian giữa các lần lấy mẫu
+                    if time.time() - last_sample_t < interval:
+                        continue
+
                     dets2 = face_detector(frame2)
                     if not dets2:
-                        cv2.imshow('3D Face Recognition (q to quit)', frame2)
-                        cv2.waitKey(1)
                         attempts += 1
                         continue
                     bbox2 = dets2[0]
@@ -283,12 +305,11 @@ def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.4, cam_
                             with torch.no_grad():
                                 emb2 = model(torch.from_numpy(x_in_numpy).to(device)).cpu().squeeze(0)
                         collected.append(emb2)
-                        print(f'Collected {len(collected)}/{K}')
+                        last_sample_t = time.time() # Cập nhật mốc thời gian chụp ảnh thành công
+                        print(f'Collected {len(collected)}/{K} (Next sample in {interval}s...)')
                     except Exception:
                         attempts += 1
                         continue
-                    cv2.imshow('3D Face Recognition (q to quit)', frame2)
-                    cv2.waitKey(1)
                 if len(collected) == 0:
                     print('No valid faces collected, abort enrollment')
                 else:
@@ -313,7 +334,7 @@ if __name__ == '__main__':
     p.add_argument('--config', default='configs/mb1_120x120.yml', help='path to tddfa config')
     p.add_argument('--gallery', required=True)
     p.add_argument('--device', default='cpu')
-    p.add_argument('--threshold', type=float, default=0.4)
+    p.add_argument('--threshold', type=float, default=0.6) # Tăng ngưỡng mặc định để tránh nhận diện nhầm
     p.add_argument('--cam', type=int, default=0)
     p.add_argument('--onnx', action='store_true', help='use onnxruntime for inference')
     p.add_argument('--skip', type=int, default=3, help='process heavy inference every N frames')
