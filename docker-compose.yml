@@ -1,0 +1,16 @@
+services:
+
+  app:
+    build: .
+    container_name: face_recog_app
+    ports:
+      - "8080:8080" 
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    environment:
+      - DB_HOST=database-iot.c7oewgusah9l.ap-southeast-1.rds.amazonaws.com
+      - DB_PORT=5432
+      - DB_NAME=face_recog_db
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres 

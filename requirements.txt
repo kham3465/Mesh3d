@@ -1,15 +1,36 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
-matplotlib
-numpy
-opencv-python # cv2
+torchaudio
+
+# Web & API
+gradio==4.43.0
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+# Build
+Cython
+
+# Core ML/CV
+numpy<2.0
+Pillow
+boto3==1.35.72
+botocore==1.35.72
+urllib3==2.2.2
+opencv-python-headless
+onnxruntime
+onnxscript
+scikit-image
+
+# Utilities
+PyYAML
 imageio
 imageio-ffmpeg
-pyyaml # yaml
 tqdm
-argparse
-cython
-scikit-image # skimage
-scipy
-onnxruntime
-gradio
+matplotlib
+
+# Database
+psycopg2-binary
+pgvector

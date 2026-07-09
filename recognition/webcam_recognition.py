@@ -28,7 +28,7 @@ try:
 except Exception:
     crop_img = None
 
-def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.6, cam_id=0, input_size=112, gallery_fp='gallery.pkl', use_onnx=False, frame_skip=3):
+def run(checkpoint, gallery_root, config_path, device='cpu', threshold=0.5, cam_id=0, input_size=112, gallery_fp='gallery.pkl', use_onnx=False, frame_skip=3):
     device = torch.device(device)
 
     if not os.path.exists(checkpoint):

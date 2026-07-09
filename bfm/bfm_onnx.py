@@ -60,8 +60,7 @@ class BFMModel_ONNX(nn.Module):
         # self.w_shp_base = self.w_shp[self.keypoints]
         # self.w_exp_base = self.w_exp[self.keypoints]
 
-    def forward(self, *inps):
-        R, offset, alpha_shp, alpha_exp = inps
+    def forward(self, R, offset, alpha_shp, alpha_exp):
         alpha = torch.cat((alpha_shp, alpha_exp))
         # pts3d = R @ (self.u + self.w_shp.matmul(alpha_shp) + self.w_exp.matmul(alpha_exp)). \
         #     view(-1, 3).transpose(1, 0) + offset
@@ -83,16 +82,18 @@ def convert_bfm_to_onnx(bfm_onnx_fp, shape_dim=40, exp_dim=10):
         bfm_decoder,
         (R, offset, alpha_shp, alpha_exp),
         bfm_onnx_fp,
-        input_names=['R', 'offset', 'alpha_shp', 'alpha_exp'],
-        output_names=['output'],
-        dynamic_axes={
-            'alpha_shp': [0],
-            'alpha_exp': [0],
+        input_names=["R", "offset", "alpha_shp", "alpha_exp"],
+        output_names=["output"],
+        # Sử dụng cú pháp dynamic_shapes mới thay cho dynamic_axes đã lỗi thời
+        dynamic_shapes={
+            "R": {},  # Kích thước cố định
+            "offset": {},  # Kích thước cố định
+            "alpha_shp": {0: "shape_dim"},
+            "alpha_exp": {0: "exp_dim"},
         },
         do_constant_folding=True
     )
     print(f'Convert {bfm_fp} to {bfm_onnx_fp} done.')
-
 
 if __name__ == '__main__':
     convert_bfm_to_onnx('../configs/bfm_noneck_v3.onnx')
