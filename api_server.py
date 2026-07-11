@@ -11,7 +11,7 @@ import io
 import uuid
 from PIL import Image
 import boto3
-from typing import List
+from typing import List, Optional
 
 # FastAPI và Pydantic
 from fastapi import FastAPI, HTTPException
@@ -71,6 +71,7 @@ class EnrollResponse(BaseModel):
 
 class EnrollRequest(BaseModel):
     images: List[str] = Field(..., description="Danh sách các ảnh đã được mã hóa Base64.")
+    name: Optional[str] = Field(None, description="Tên người dùng (tùy chọn).")
 
 class RecognizeRequest(BaseModel):
     images: List[str] = Field(..., description="Danh sách các ảnh đã được mã hóa Base64.")
@@ -81,7 +82,7 @@ class UpdateNameRequest(BaseModel):
 class Identity(BaseModel):
     id: int
     name: str
-    image_url: str = None
+    image_url: Optional[str] = None
 
 class RecognizeResponse(BaseModel):
     identity: str
@@ -168,6 +169,14 @@ async def enroll(request: EnrollRequest):
     new_id, message = enroll_person_db(mean_emb_np, None)
     if new_id == -1:
         raise HTTPException(status_code=500, detail=message)
+
+    # Gán tên cho identity vừa tạo (nếu client gửi kèm)
+    if request.name:
+        name_message = update_person_name_db(new_id, request.name)
+        if "Lỗi" in name_message or "Không tìm thấy" in name_message:
+            # Trùng tên (cột name unique) -> 409, identity không tên đã được tạo (chấp nhận, không rollback)
+            status_code = 409 if "đã tồn tại" in name_message else 500
+            raise HTTPException(status_code=status_code, detail=name_message)
 
     # Bước 2: Tải ảnh đầu tiên lên S3 (nếu có) và cập nhật lại DB
     if first_image_bytes:
